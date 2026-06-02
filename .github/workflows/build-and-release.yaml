@@ -1,4 +1,4 @@
-name: Build and Release Windows Python 3.9.1 Wheel
+name: Build Windows Wheel with Python 3.9.1
 
 on:
   workflow_dispatch:
@@ -6,14 +6,13 @@ on:
       release_suffix:
         description: "Release suffix"
         required: true
-        default: "py391-vs2019"
+        default: "py391-direct"
       runner:
         description: "Windows runner"
         required: true
-        default: "windows-2019"
+        default: "windows-2022"
         type: choice
         options:
-          - windows-2019
           - windows-2022
 
 permissions:
@@ -32,11 +31,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Verify source and submodule patch
+      - name: Verify submodule patch
         shell: pwsh
         run: |
           git status
-          git rev-parse HEAD
           git submodule status
 
           @'
@@ -49,17 +47,13 @@ jobs:
 
           for file in files:
               print("Checking", file)
-              if not file.exists():
-                  raise RuntimeError(f"Missing file: {file}")
-
               text = file.read_text(encoding="utf-8", errors="ignore")
               if "#include <chrono>" not in text:
                   raise RuntimeError(f"Missing #include <chrono> in {file}")
+              print("OK")
+          '@ | py -3 -c "import sys; exec(sys.stdin.read())"
 
-              print("OK:", file)
-          '@ | python
-
-      - name: Install Python 3.9.1 x64
+      - name: Install Python 3.9.1 x64 manually
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -70,51 +64,43 @@ jobs:
 
           Invoke-WebRequest -Uri $url -OutFile $installer
 
-          Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 TargetDir=$target Include_pip=1 Include_launcher=0 PrependPath=0" -Wait
+          Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 TargetDir=$target Include_pip=1 Include_launcher=0 PrependPath=0 Include_test=0" -Wait
 
-          "$target" | Out-File -FilePath $env:GITHUB_PATH -Append
-          "$target\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
+          if (-not (Test-Path "$target\python.exe")) {
+            throw "Python 3.9.1 install failed. python.exe not found."
+          }
 
           & "$target\python.exe" --version
-          & "$target\python.exe" -c "import sys; print(sys.version); print(sys.executable)"
+          & "$target\python.exe" -c "import sys; print(sys.version); assert sys.version.startswith('3.9.1'), sys.version"
 
           "PY391=$target\python.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Set up MSVC 2019 build environment
+      - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          toolset: 14.29
 
-      - name: Install Python build dependencies
+      - name: Install build dependencies using Python 3.9.1
         shell: pwsh
         run: |
+          & $env:PY391 -c "import sys; print(sys.version); assert sys.version.startswith('3.9.1'), sys.version"
           & $env:PY391 -m pip install --upgrade "pip<26" setuptools wheel
-
-          # Pin build tools so Python 3.9.1 is not using very new build tooling.
           & $env:PY391 -m pip install "cmake==3.29.6" "ninja==1.11.1.1" "scikit-build-core==0.10.7" build uv
-
           & $env:PY391 -m pip list
 
-      - name: Build wheel with Python 3.9.1 and MSVC 2019
+      - name: Build wheel directly with Python 3.9.1
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           New-Item -ItemType Directory -Force -Path wheelhouse | Out-Null
 
-          # Use direct source build with Python 3.9.1.
-          # Do not set custom optimization flags yet.
           Remove-Item Env:CMAKE_ARGS -ErrorAction SilentlyContinue
           Remove-Item Env:FORCE_CMAKE -ErrorAction SilentlyContinue
 
-          # Keep build isolation off so our pinned cmake/scikit-build-core are used.
-          & $env:PY391 -m pip wheel . --no-deps --no-build-isolation -w wheelhouse -v
+          & $env:PY391 -c "import sys; print('BUILD PYTHON:', sys.version); assert sys.version.startswith('3.9.1'), sys.version"
 
-      - name: Show wheel
-        shell: pwsh
-        run: |
-          Get-ChildItem wheelhouse | Format-Table Name, Length, LastWriteTime
+          & $env:PY391 -m pip wheel . --no-deps --no-build-isolation -w wheelhouse -v
 
       - name: Generate wheel DLL hash report
         shell: pwsh
@@ -138,34 +124,20 @@ jobs:
 
               with zipfile.ZipFile(wheel, "r") as z:
                   dlls = sorted(name for name in z.namelist() if name.lower().endswith(".dll"))
-
                   for name in dlls:
                       data = z.read(name)
-                      print(
-                          Path(name).name,
-                          len(data),
-                          hashlib.sha256(data).hexdigest(),
-                          name,
-                      )
+                      print(Path(name).name, len(data), hashlib.sha256(data).hexdigest(), name)
           '@ | & $env:PY391 | Tee-Object reports\wheel_dll_hashes.txt
 
-      - name: Test wheel with real Python 3.9.1 on runner
+      - name: Test wheel with Python 3.9.1 on runner
         shell: pwsh
         continue-on-error: true
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
 
-          if (-not $env:PY391) {
-            throw "PY391 environment variable is missing. Python 3.9.1 was not installed correctly."
-          }
-
-          Write-Host "PY391=$env:PY391"
-          & $env:PY391 --version
-          & $env:PY391 -c "import sys; print(sys.version); assert sys.version.startswith('3.9.1'), sys.version"
-
           $wheel = Get-ChildItem wheelhouse -Filter "*.whl" | Select-Object -First 1
           if (-not $wheel) {
-            throw "No wheel found in wheelhouse"
+            throw "No wheel found."
           }
 
           & $env:PY391 -m venv testenv391
@@ -226,15 +198,20 @@ jobs:
           print(result.stdout)
           print(result.stderr)
           '@ | .\testenv391\Scripts\python.exe | Tee-Object reports\runner_py391_backend_test.txt
-          
+
+      - name: Show outputs
+        shell: pwsh
+        run: |
+          Get-ChildItem wheelhouse | Format-Table Name, Length, LastWriteTime
+          Get-ChildItem reports | Format-Table Name, Length, LastWriteTime
+
       - name: Create release tag
         shell: pwsh
         run: |
           $suffix = "${{ github.event.inputs.release_suffix }}"
           $runner = "${{ github.event.inputs.runner }}"
           $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-
-          "RELEASE_TAG=llama-cpp-python-0.3.2-cp391-$runner-$suffix-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_TAG=llama-cpp-python-0.3.2-py391-$runner-$suffix-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -242,16 +219,16 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
           body: |
-            Custom Windows wheel for llama-cpp-python built specifically with Python 3.9.1.
+            Custom Windows wheel for llama-cpp-python built directly with Python 3.9.1.
 
             Build method:
-            - Built from forked source.
-            - Uses recursive submodules.
-            - Uses patched llama.cpp submodule.
-            - Python used for build: 3.9.1 x64
-            - MSVC environment: VS2019 / v142
-            - Direct pip wheel build, no cibuildwheel
-            - No custom CMAKE_ARGS
+            - Forked source.
+            - Patched llama.cpp submodule.
+            - Manual Python 3.9.1 install.
+            - Direct pip wheel build.
+            - No cibuildwheel.
+            - No setup-python.
+            - No custom CMAKE_ARGS.
 
             Included reports:
             - wheel_dll_hashes.txt
