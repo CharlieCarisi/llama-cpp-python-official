@@ -1,214 +1,245 @@
-name: Build Release
+name: Build and Release Windows Python 3.9.1 Wheel
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      release_suffix:
+        description: "Release suffix"
+        required: true
+        default: "py391-vs2019"
+      runner:
+        description: "Windows runner"
+        required: true
+        default: "windows-2019"
+        type: choice
+        options:
+          - windows-2019
+          - windows-2022
 
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  build_wheels:
-    name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, windows-2022, macos-14, macos-15]
+  build-release:
+    runs-on: ${{ github.event.inputs.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout fork source
+        uses: actions/checkout@v4
         with:
-          submodules: "recursive"
+          submodules: recursive
 
-      # Used to host cibuildwheel
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-
-      - name: Install dependencies (Linux/MacOS)
-        if: runner.os != 'Windows'
+      - name: Verify source and submodule patch
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install uv
-          RUST_LOG=trace python -m uv pip install -e .[all] --verbose
-        shell: bash
+          git status
+          git rev-parse HEAD
+          git submodule status
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        env:
-          RUST_LOG: trace        
+          @'
+          from pathlib import Path
+
+          files = [
+              Path("vendor/llama.cpp/common/common.cpp"),
+              Path("vendor/llama.cpp/common/log.cpp"),
+          ]
+
+          for file in files:
+              print("Checking", file)
+              if not file.exists():
+                  raise RuntimeError(f"Missing file: {file}")
+
+              text = file.read_text(encoding="utf-8", errors="ignore")
+              if "#include <chrono>" not in text:
+                  raise RuntimeError(f"Missing #include <chrono> in {file}")
+
+              print("OK:", file)
+          '@ | python
+
+      - name: Install Python 3.9.1 x64
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install uv
-          python -m uv pip install -e .[all] --verbose
-        shell: cmd
+          $ErrorActionPreference = "Stop"
 
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
-        env:
-          # Keep repair disabled by default for non-Linux platforms in this job.
-          CIBW_REPAIR_WHEEL_COMMAND: ""
-          # Linux needs auditwheel repair so manylinux and musllinux wheels are
-          # published with distinct platform tags instead of generic linux tags.
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "LD_LIBRARY_PATH=/project/llama_cpp/lib auditwheel repair -w {dest_dir} {wheel}"
-          # The release wheel is tagged py3-none, so one build per platform
-          # covers all supported Python versions and avoids duplicate names.
-          CIBW_BUILD_LINUX: "cp38-*"
-          CIBW_BUILD_MACOS: "cp39-*"
-          CIBW_BUILD_WINDOWS: "cp39-*"
-          # Skip cibuildwheel's default i686 sidecar and keep Linux release
-          # wheels on a portable x86_64 CPU baseline.
-          CIBW_ARCHS_LINUX: "auto64"
-          CIBW_ARCHS_WINDOWS: "AMD64"
-          CIBW_ENVIRONMENT_LINUX: CMAKE_ARGS="-DGGML_NATIVE=off"
-          # Keep macOS release wheels on a portable CPU baseline instead of
-          # inheriting the hosted runner's native flags.
-          CIBW_ENVIRONMENT_MACOS: CMAKE_ARGS="-DGGML_NATIVE=off"
+          $url = "https://www.python.org/ftp/python/3.9.1/python-3.9.1-amd64.exe"
+          $installer = "$env:RUNNER_TEMP\python-3.9.1-amd64.exe"
+          $target = "$env:USERPROFILE\Python391"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          Start-Process -FilePath $installer -ArgumentList "/quiet InstallAllUsers=0 TargetDir=$target Include_pip=1 Include_launcher=0 PrependPath=0" -Wait
+
+          "$target" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$target\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          & "$target\python.exe" --version
+          & "$target\python.exe" -c "import sys; print(sys.version); print(sys.executable)"
+
+          "PY391=$target\python.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Set up MSVC 2019 build environment
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          package-dir: .
-          output-dir: wheelhouse
+          arch: x64
+          toolset: 14.29
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}
-          path: ./wheelhouse/*.whl
-
-  build_wheels_arm64:
-    name: Build arm64 wheels
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
-        env:
-          CIBW_SKIP: "*musllinux* pp*"
-          CIBW_REPAIR_WHEEL_COMMAND: ""
-          CIBW_ARCHS: "aarch64"
-          # Keep native arm64 builds on a portable CPU baseline instead of
-          # tuning wheels to the hosted runner.
-          CIBW_ENVIRONMENT: CMAKE_ARGS="-DGGML_NATIVE=off"
-          # The release wheel is tagged py3-none, so one build covers all
-          # supported Python versions and avoids duplicate wheel names.
-          CIBW_BUILD: "cp38-*"
-        with:
-          output-dir: wheelhouse
-
-      - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels_arm64
-          path: ./wheelhouse/*.whl
-
-  build_wheels_riscv64:
-    name: Build riscv64 wheels (${{ matrix.shard.name }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
-          - name: cp310
-            build: "cp310-*"
-            artifact: wheels_riscv64_cp310
-          - name: cp311
-            build: "cp311-*"
-            artifact: wheels_riscv64_cp311
-          - name: cp312
-            build: "cp312-*"
-            artifact: wheels_riscv64_cp312
-          - name: cp313
-            build: "cp313-*"
-            artifact: wheels_riscv64_cp313
-          - name: cp314
-            build: "cp314-*"
-            artifact: wheels_riscv64_cp314
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/riscv64
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v3.1.2
-        env:
-          CIBW_SKIP: "*musllinux* pp*"
-          CIBW_REPAIR_WHEEL_COMMAND: ""
-          CIBW_ARCHS: "riscv64"
-          # Build riscv64 wheels against a conservative baseline instead of
-          # enabling RVV-related extensions from the build container.
-          CIBW_ENVIRONMENT: CMAKE_ARGS="-DGGML_NATIVE=off -DGGML_RVV=off -DGGML_RV_ZFH=off -DGGML_RV_ZVFH=off -DGGML_RV_ZICBOP=off -DGGML_RV_ZIHINTPAUSE=off"
-          # Split the emulated riscv64 build into one Python version per job
-          # to minimize wall-clock time without changing the release artifacts.
-          CIBW_BUILD: ${{ matrix.shard.build }}
-        with:
-          output-dir: wheelhouse
-
-      - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.shard.artifact }}
-          path: ./wheelhouse/*.whl
-
-  build_sdist:
-    name: Build source distribution
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-
-      - name: Install dependencies (Linux/MacOS)
-        if: runner.os != 'Windows'
+      - name: Install Python build dependencies
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install uv
-          RUST_LOG=trace python -m uv pip install -e .[all] --verbose
-          python -m uv pip install build
-        shell: bash
+          & $env:PY391 -m pip install --upgrade "pip<26" setuptools wheel
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        env:
-          RUST_LOG: trace        
+          # Pin build tools so Python 3.9.1 is not using very new build tooling.
+          & $env:PY391 -m pip install "cmake==3.29.6" "ninja==1.11.1.1" "scikit-build-core==0.10.7" build uv
+
+          & $env:PY391 -m pip list
+
+      - name: Build wheel with Python 3.9.1 and MSVC 2019
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install uv
-          python -m uv pip install -e .[all] --verbose
-          python -m uv pip install build
-        shell: cmd
+          $ErrorActionPreference = "Stop"
 
-      - name: Build source distribution
+          New-Item -ItemType Directory -Force -Path wheelhouse | Out-Null
+
+          # Use direct source build with Python 3.9.1.
+          # Do not set custom optimization flags yet.
+          Remove-Item Env:CMAKE_ARGS -ErrorAction SilentlyContinue
+          Remove-Item Env:FORCE_CMAKE -ErrorAction SilentlyContinue
+
+          # Keep build isolation off so our pinned cmake/scikit-build-core are used.
+          & $env:PY391 -m pip wheel . --no-deps --no-build-isolation -w wheelhouse -v
+
+      - name: Show wheel
+        shell: pwsh
         run: |
-          python -m build --sdist
+          Get-ChildItem wheelhouse | Format-Table Name, Length, LastWriteTime
 
-      - uses: actions/upload-artifact@v4
+      - name: Generate wheel DLL hash report
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+
+          @'
+          import zipfile
+          import hashlib
+          from pathlib import Path
+
+          wheels = list(Path("wheelhouse").glob("*.whl"))
+          if not wheels:
+              raise RuntimeError("No wheel found in wheelhouse")
+
+          for wheel in wheels:
+              print("Wheel:", wheel.name)
+              print("Wheel size:", wheel.stat().st_size)
+              print("Wheel sha256:", hashlib.sha256(wheel.read_bytes()).hexdigest())
+              print()
+
+              with zipfile.ZipFile(wheel, "r") as z:
+                  dlls = sorted(name for name in z.namelist() if name.lower().endswith(".dll"))
+
+                  for name in dlls:
+                      data = z.read(name)
+                      print(
+                          Path(name).name,
+                          len(data),
+                          hashlib.sha256(data).hexdigest(),
+                          name,
+                      )
+          '@ | & $env:PY391 | Tee-Object reports\wheel_dll_hashes.txt
+
+      - name: Test wheel with Python 3.9.1 on runner
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+
+          $wheel = Get-ChildItem wheelhouse -Filter "*.whl" | Select-Object -First 1
+
+          & $env:PY391 -m venv testenv391
+          .\testenv391\Scripts\python.exe -m pip install --upgrade "pip<26" setuptools wheel
+          .\testenv391\Scripts\python.exe -m pip install "numpy<2" diskcache jinja2 typing-extensions
+          .\testenv391\Scripts\python.exe -m pip install --force-reinstall --no-deps $wheel.FullName
+
+          @'
+          import os
+          import sys
+          import platform
+          import traceback
+          import subprocess
+          from pathlib import Path
+
+          print("Python:", sys.version)
+          print("Executable:", sys.executable)
+          print("Platform:", platform.platform())
+
+          import llama_cpp
+          print("llama_cpp version:", getattr(llama_cpp, "__version__", "unknown"))
+          print("llama_cpp file:", llama_cpp.__file__)
+
+          lib = Path(llama_cpp.__file__).resolve().parent / "lib"
+          print("lib:", lib)
+
+          for dll in sorted(lib.glob("*.dll")):
+              print(dll.name, dll.stat().st_size)
+
+          os.add_dll_directory(str(lib))
+
+          from llama_cpp import llama_cpp as lc
+          print("Native module:", lc)
+
+          try:
+              print("Calling llama_backend_init()")
+              lc.llama_backend_init()
+              print("llama_backend_init OK")
+              lc.llama_backend_free()
+              print("llama_backend_free OK")
+          except Exception:
+              print("llama_backend_init FAILED")
+              traceback.print_exc()
+
+          print()
+          print("Loaded modules:")
+          result = subprocess.run(
+              f'tasklist /m /fi "PID eq {os.getpid()}"',
+              shell=True,
+              capture_output=True,
+              text=True,
+          )
+          print(result.stdout)
+          print(result.stderr)
+          '@ | .\testenv391\Scripts\python.exe | Tee-Object reports\runner_py391_backend_test.txt
+
+      - name: Create release tag
+        shell: pwsh
+        run: |
+          $suffix = "${{ github.event.inputs.release_suffix }}"
+          $runner = "${{ github.event.inputs.runner }}"
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+          "RELEASE_TAG=llama-cpp-python-0.3.2-cp391-$runner-$suffix-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: sdist
-          path: ./dist/*.tar.gz
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: |
+            Custom Windows wheel for llama-cpp-python built specifically with Python 3.9.1.
 
-  release:
-    name: Release
-    needs: [build_wheels, build_wheels_arm64, build_wheels_riscv64, build_sdist]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+            Build method:
+            - Built from forked source.
+            - Uses recursive submodules.
+            - Uses patched llama.cpp submodule.
+            - Python used for build: 3.9.1 x64
+            - MSVC environment: VS2019 / v142
+            - Direct pip wheel build, no cibuildwheel
+            - No custom CMAKE_ARGS
 
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          path: dist
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            Included reports:
+            - wheel_dll_hashes.txt
+            - runner_py391_backend_test.txt
+          files: |
+            wheelhouse/*.whl
+            reports/*.txt
