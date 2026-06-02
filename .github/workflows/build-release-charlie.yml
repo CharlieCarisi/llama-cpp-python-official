@@ -1,0 +1,195 @@
+name: Build and Release Windows cp39 Wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_suffix:
+        description: "Release suffix"
+        required: true
+        default: "patched-submodule"
+      runner:
+        description: "Windows runner"
+        required: true
+        default: "windows-2022"
+        type: choice
+        options:
+          - windows-2022
+          - windows-2019
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-release:
+    runs-on: ${{ github.event.inputs.runner }}
+
+    steps:
+      - name: Checkout fork source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify source branch and submodule
+        shell: pwsh
+        run: |
+          git status
+          git rev-parse HEAD
+          git submodule status
+          cd vendor/llama.cpp
+          git remote -v
+          git branch --show-current
+          git rev-parse HEAD
+          cd ../..
+
+      - name: Verify chrono patch exists
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          files = [
+              Path("vendor/llama.cpp/common/common.cpp"),
+              Path("vendor/llama.cpp/common/log.cpp"),
+          ]
+
+          for file in files:
+              print("Checking", file)
+              text = file.read_text(encoding="utf-8", errors="ignore")
+              if "#include <chrono>" not in text:
+                  raise RuntimeError(f"Missing #include <chrono> in {file}")
+              print("OK")
+          '@ | python
+
+      - name: Set up Python 3.9 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          architecture: "x64"
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade "pip<26" setuptools wheel
+          python -m pip install "cibuildwheel==2.21.1" build uv
+
+      - name: Install project build dependencies
+        shell: pwsh
+        run: |
+          python -m uv pip install --system -e ".[all]" --verbose
+
+      - name: Build Windows cp39 wheel
+        shell: pwsh
+        run: |
+          $env:CIBW_BUILD = "cp39-win_amd64"
+          $env:CIBW_SKIP = "*musllinux* pp*"
+          $env:CIBW_REPAIR_WHEEL_COMMAND = ""
+          $env:CIBW_BUILD_VERBOSITY = "1"
+
+          Remove-Item Env:CMAKE_ARGS -ErrorAction SilentlyContinue
+          Remove-Item Env:FORCE_CMAKE -ErrorAction SilentlyContinue
+
+          python -m cibuildwheel . --output-dir wheelhouse
+
+      - name: Generate wheel DLL hash report
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+
+          @'
+          import zipfile
+          import hashlib
+          from pathlib import Path
+
+          wheels = list(Path("wheelhouse").glob("*.whl"))
+          if not wheels:
+              raise RuntimeError("No wheel found in wheelhouse")
+
+          for wheel in wheels:
+              print("Wheel:", wheel.name)
+              print("Wheel size:", wheel.stat().st_size)
+              print("Wheel sha256:", hashlib.sha256(wheel.read_bytes()).hexdigest())
+              print()
+
+              with zipfile.ZipFile(wheel, "r") as z:
+                  dlls = sorted(name for name in z.namelist() if name.lower().endswith(".dll"))
+                  for name in dlls:
+                      data = z.read(name)
+                      print(Path(name).name, len(data), hashlib.sha256(data).hexdigest(), name)
+          '@ | python | Tee-Object reports\wheel_dll_hashes.txt
+
+      - name: Test wheel backend init on runner
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+
+          $wheel = Get-ChildItem wheelhouse -Filter "*.whl" | Select-Object -First 1
+
+          python -m venv testenv
+          .\testenv\Scripts\python.exe -m pip install --upgrade "pip<26" setuptools wheel
+          .\testenv\Scripts\python.exe -m pip install "numpy<2" diskcache jinja2 typing-extensions
+          .\testenv\Scripts\python.exe -m pip install --force-reinstall --no-deps $wheel.FullName
+
+          @'
+          import os
+          import sys
+          import traceback
+          from pathlib import Path
+
+          import llama_cpp
+
+          print("Python:", sys.version)
+          print("llama_cpp version:", getattr(llama_cpp, "__version__", "unknown"))
+          print("llama_cpp file:", llama_cpp.__file__)
+
+          lib = Path(llama_cpp.__file__).resolve().parent / "lib"
+          print("lib:", lib)
+
+          for dll in sorted(lib.glob("*.dll")):
+              print(dll.name, dll.stat().st_size)
+
+          os.add_dll_directory(str(lib))
+
+          from llama_cpp import llama_cpp as lc
+
+          try:
+              print("Calling llama_backend_init()")
+              lc.llama_backend_init()
+              print("llama_backend_init OK")
+              lc.llama_backend_free()
+              print("llama_backend_free OK")
+          except Exception:
+              print("llama_backend_init FAILED")
+              traceback.print_exc()
+          '@ | .\testenv\Scripts\python.exe | Tee-Object reports\runner_backend_test.txt
+
+      - name: Create release tag
+        shell: pwsh
+        run: |
+          $suffix = "${{ github.event.inputs.release_suffix }}"
+          $runner = "${{ github.event.inputs.runner }}"
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          "RELEASE_TAG=llama-cpp-python-0.3.2-cp39-$runner-$suffix-$timestamp" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: |
+            Custom Windows cp39 wheel for llama-cpp-python.
+
+            Build method:
+            - Built directly from forked source.
+            - Uses patched llama.cpp submodule.
+            - Builds cp39-win_amd64 with cibuildwheel.
+
+            Included reports:
+            - wheel_dll_hashes.txt
+            - runner_backend_test.txt
+          files: |
+            wheelhouse/*.whl
+            reports/*.txt
