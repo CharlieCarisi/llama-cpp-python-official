@@ -149,15 +149,28 @@ jobs:
                       )
           '@ | & $env:PY391 | Tee-Object reports\wheel_dll_hashes.txt
 
-      - name: Test wheel with Python 3.9.1 on runner
+      - name: Test wheel with real Python 3.9.1 on runner
         shell: pwsh
         continue-on-error: true
         run: |
           New-Item -ItemType Directory -Force -Path reports | Out-Null
 
+          if (-not $env:PY391) {
+            throw "PY391 environment variable is missing. Python 3.9.1 was not installed correctly."
+          }
+
+          Write-Host "PY391=$env:PY391"
+          & $env:PY391 --version
+          & $env:PY391 -c "import sys; print(sys.version); assert sys.version.startswith('3.9.1'), sys.version"
+
           $wheel = Get-ChildItem wheelhouse -Filter "*.whl" | Select-Object -First 1
+          if (-not $wheel) {
+            throw "No wheel found in wheelhouse"
+          }
 
           & $env:PY391 -m venv testenv391
+          .\testenv391\Scripts\python.exe -c "import sys; print(sys.version); assert sys.version.startswith('3.9.1'), sys.version"
+
           .\testenv391\Scripts\python.exe -m pip install --upgrade "pip<26" setuptools wheel
           .\testenv391\Scripts\python.exe -m pip install "numpy<2" diskcache jinja2 typing-extensions
           .\testenv391\Scripts\python.exe -m pip install --force-reinstall --no-deps $wheel.FullName
@@ -173,6 +186,9 @@ jobs:
           print("Python:", sys.version)
           print("Executable:", sys.executable)
           print("Platform:", platform.platform())
+
+          if not sys.version.startswith("3.9.1"):
+              raise RuntimeError("This test is not using Python 3.9.1")
 
           import llama_cpp
           print("llama_cpp version:", getattr(llama_cpp, "__version__", "unknown"))
@@ -210,7 +226,7 @@ jobs:
           print(result.stdout)
           print(result.stderr)
           '@ | .\testenv391\Scripts\python.exe | Tee-Object reports\runner_py391_backend_test.txt
-
+          
       - name: Create release tag
         shell: pwsh
         run: |
